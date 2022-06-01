@@ -44,8 +44,8 @@
 #define FILE_SEPARATOR		\
     "==================================================================="
 
-#define TAG_OPEN		"@secnote-open"
-#define TAG_CLOSE		"@secnote-close"
+#define TAG_OPEN		"\x40secnote-open"
+#define TAG_CLOSE		"\x40secnote-close"
 
 #define MAX(a, b)		((a > b) ? a : b)
 #define MIN(a, b)		((a < b) ? a : b)
@@ -109,6 +109,8 @@ static void	file_parse(struct context *, const char *);
 static int	file_read_line(struct file *, char *, size_t);
 static void	file_open(struct file *, const char *, const char *);
 
+static void	text_topic_dump(struct context *);
+static int	text_chunk_new_entries(struct topic *, int *);
 static void	text_topic_write(struct context *, struct topic *);
 static void	text_topic_header(struct context *, struct topic *);
 
@@ -118,8 +120,9 @@ static void	load_from_args(struct context *, int, char **);
 static int	dump_parse_entry(struct context *, struct file *, char *);
 static int	dump_parse_topic(struct context *, struct file *, const char *);
 
-static void	text_topic_dump(struct context *);
+static void	topic_entry_free(struct entry *);
 static void	topic_free(struct context *, struct topic *);
+
 static void	context_compare(struct context *, struct context *);
 
 static struct topic	*topic_resolve(struct context *, const char *);
@@ -237,6 +240,9 @@ context_compare(struct context *verify, struct context *ondisk)
 		TAILQ_FOREACH(entry, &t1->entries, list) {
 			state = entry_check_state(&t2->entries, entry, &ent);
 
+			if (ent != NULL)
+				TAILQ_REMOVE(&t2->entries, ent, list);
+
 			if (state != ENTRY_STATE_SAME && !header) {
 				header = 1;
 				printf("@ %s\n\n", t1->name);
@@ -244,19 +250,23 @@ context_compare(struct context *verify, struct context *ondisk)
 
 			switch (state) {
 			case ENTRY_STATE_SAME:
+				if (ent != NULL)
+					topic_entry_free(ent);
 				continue;
 			case ENTRY_STATE_GONE:
 				changes++;
-				printf("chunk '%s' (%d-%d) not found\n",
+				printf("!! chunk '%s' (%d-%d) not found\n",
 				    entry->file, entry->line_start,
 				    entry->line_end);
+				if (ent != NULL)
+					topic_entry_free(ent);
 				continue;
 			}
 
 			changes++;
 			sep = NULL;
 
-			printf("chunk '%s' (%d-%d) ", entry->file,
+			printf("+- chunk '%s' (%d-%d) ", entry->file,
 			    entry->line_start, entry->line_end);
 
 			a = entry->line_end - entry->line_start;
@@ -285,8 +295,19 @@ context_compare(struct context *verify, struct context *ondisk)
 			}
 
 			printf("\n");
+			topic_entry_free(ent);
 		}
 
+		changes += text_chunk_new_entries(t2, &header);
+		topic_free(ondisk, t2);
+
+		if (header)
+			printf("\n");
+	}
+
+	TAILQ_FOREACH(t1, &ondisk->topics, list) {
+		header = 0;
+		changes += text_chunk_new_entries(t1, &header);
 		if (header)
 			printf("\n");
 	}
@@ -647,32 +668,33 @@ topic_resolve(struct context *ctx, const char *name)
 static void
 topic_free(struct context *ctx, struct topic *topic)
 {
-	struct line	*line, *lnext;
-	struct entry	*entry, *enext;
+	struct entry	*entry;
 
 	TAILQ_REMOVE(&ctx->topics, topic, list);
 
-	for (entry = TAILQ_FIRST(&topic->entries); entry != NULL;
-	    entry = enext) {
-		enext = TAILQ_NEXT(entry, list);
+	while ((entry = TAILQ_FIRST(&topic->entries)) != NULL) {
 		TAILQ_REMOVE(&topic->entries, entry, list);
-
-		for (line = TAILQ_FIRST(&entry->lines); line != NULL;
-		    line = lnext) {
-			lnext = TAILQ_NEXT(line, list);
-			TAILQ_REMOVE(&entry->lines, line, list);
-
-			free(line->code);
-			free(line);
-		}
-
-		free(entry->context);
-		free(entry->file);
-		free(entry);
+		topic_entry_free(entry);
 	}
 
 	free(topic->name);
 	free(topic);
+}
+
+static void
+topic_entry_free(struct entry *entry)
+{
+	struct line	*line;
+
+	while ((line = TAILQ_FIRST(&entry->lines)) != NULL) {
+		TAILQ_REMOVE(&entry->lines, line, list);
+		free(line->code);
+		free(line);
+	}
+
+	free(entry->context);
+	free(entry->file);
+	free(entry);
 }
 
 static struct entry *
@@ -787,6 +809,28 @@ entry_check_state(struct entry_list *head, struct entry *orig,
 	*out = NULL;
 
 	return (ENTRY_STATE_GONE);
+}
+
+static int
+text_chunk_new_entries(struct topic *topic, int *header)
+{
+	int		new;
+	struct entry	*entry;
+
+	new = 0;
+
+	TAILQ_FOREACH(entry, &topic->entries, list) {
+		if (*header == 0) {
+			*header = 1;
+			printf("@ %s\n\n", topic->name);
+		}
+
+		new++;
+		printf("++ chunk '%s' (%d-%d) new\n", entry->file,
+		    entry->line_start, entry->line_end);
+	}
+
+	return (new);
 }
 
 static void
