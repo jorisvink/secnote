@@ -166,6 +166,7 @@ main(int argc, char *argv[])
 			ctx.pnum = strtonum(optarg, 0, 255, &err);
 			if (err != NULL)
 				fatal("-p %s invalid: %s", optarg, err);
+			vfy.pnum = ctx.pnum;
 			break;
 		case 'q':
 			ctx.query = optarg;
