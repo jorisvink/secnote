@@ -16,6 +16,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/queue.h>
 
 #include <openssl/sha.h>
@@ -31,6 +32,13 @@
 #include <string.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <bsd/bsd.h>
+#endif
+
+#define FILE_TYPE_C		1
+#define FILE_TYPE_PYTHON	2
+
 #define DUMP_PARSE_TOPIC	1
 #define DUMP_PARSE_ENTRY	2
 
@@ -38,8 +46,7 @@
 #define ENTRY_STATE_DIFFERS	(1 << 2)
 #define ENTRY_STATE_GONE	(1 << 3)
 #define ENTRY_STATE_SAME	(1 << 4)
-#define ENTRY_STATE_GREW	(1 << 5)
-#define ENTRY_STATE_SHRUNK	(1 << 6)
+#define ENTRY_STATE_RENAMED	(1 << 5)
 
 #define FILE_SEPARATOR		\
     "==================================================================="
@@ -58,6 +65,7 @@ struct line {
 struct entry {
 	int			order;
 
+	char			*id;
 	char			*file;
 	char			*code;
 	char			*context;
@@ -81,21 +89,29 @@ struct topic {
 };
 
 struct file {
+	int			type;
+	int			line;
+
 	FILE			*fp;
+	char			**lc;
 	char			*path;
+	char			buf[512];
 };
 
 struct context {
+	int			db;
 	int			list;
 	int			pnum;
 	int			full;
-	int			digest;
 	const char		*query;
 
 	struct topic		*topic;
+	struct entry		*entry;
+
 	TAILQ_HEAD(, topic)	topics;
 };
 
+static char	*xstrdup(const char *);
 static void	fatal(const char *, ...);
 static int	filecmp(const FTSENT **, const FTSENT **);
 
@@ -103,10 +119,13 @@ static void	entry_record_line(struct entry *, const char *);
 static int	entry_check_state(struct entry_list *, struct entry *,
 		    struct entry **);
 
+static int	note_parse_arguments(char *, int *, char **, char **);
+
 static void	file_close(struct file *);
+static int	file_read_line(struct file *);
 static void	file_consume_newline(struct file *);
+static void	file_cache_line(struct file *, char *);
 static void	file_parse(struct context *, const char *);
-static int	file_read_line(struct file *, char *, size_t);
 static void	file_open(struct file *, const char *, const char *);
 
 static void	text_topic_dump(struct context *);
@@ -117,8 +136,8 @@ static void	text_topic_header(struct context *, struct topic *);
 static void	load_from_dump(struct context *, const char *);
 static void	load_from_args(struct context *, int, char **);
 
-static int	dump_parse_entry(struct context *, struct file *, char *);
-static int	dump_parse_topic(struct context *, struct file *, const char *);
+static int	dump_parse_topic(struct context *, struct file *);
+static int	dump_parse_entry(struct context *, struct file *);
 
 static void	topic_entry_free(struct entry *);
 static void	topic_free(struct context *, struct topic *);
@@ -127,7 +146,17 @@ static void	context_compare(struct context *, struct context *);
 
 static struct topic	*topic_resolve(struct context *, const char *);
 static struct entry	*topic_record_entry(struct context *, struct topic *,
-			    const char *, const char *, int);
+			    const char *, const char *, const char *, int);
+
+static struct {
+	const char	*ext;
+	int		type;
+} extlist[] = {
+	{ ".c",		FILE_TYPE_C },
+	{ ".h",		FILE_TYPE_C },
+	{ ".py",	FILE_TYPE_PYTHON },
+	{ NULL,		-1 },
+};
 
 static void
 usage(void)
@@ -155,9 +184,9 @@ main(int argc, char *argv[])
 	while ((ch = getopt(argc, argv, "dfhlp:q:v:")) != -1) {
 		switch (ch) {
 		case 'd':
+			ctx.db = 1;
 			ctx.list = 1;
 			ctx.full = 1;
-			ctx.digest = 1;
 			break;
 		case 'f':
 			ctx.full = 1;
@@ -216,14 +245,13 @@ main(int argc, char *argv[])
 static void
 context_compare(struct context *verify, struct context *ondisk)
 {
-	const char		*sep;
 	struct topic		*t1, *t2;
 	struct entry		*entry, *ent;
 	int			a, b, changes, header, state;
 
 	changes = 0;
 
-	TAILQ_FOREACH(t1, &verify->topics, list) {
+	while ((t1 = TAILQ_FIRST(&verify->topics)) != NULL) {
 		TAILQ_FOREACH(t2, &ondisk->topics, list) {
 			if (!strcmp(t2->name, t1->name))
 				break;
@@ -232,6 +260,7 @@ context_compare(struct context *verify, struct context *ondisk)
 		if (t2 == NULL) {
 			changes++;
 			printf("topic '%s' not found in source\n", t1->name);
+			topic_free(verify, t1);
 			continue;
 		}
 
@@ -243,88 +272,102 @@ context_compare(struct context *verify, struct context *ondisk)
 			if (ent != NULL)
 				TAILQ_REMOVE(&t2->entries, ent, list);
 
-			if (state != ENTRY_STATE_SAME && !header) {
-				header = 1;
-				printf("@ %s\n\n", t1->name);
+			if (state == ENTRY_STATE_SAME) {
+				if (ent != NULL)
+					topic_entry_free(ent);
+				continue;
 			}
 
+			if (!header) {
+				header = 1;
+				printf("%s\n", FILE_SEPARATOR);
+				printf("%s\n", t1->name);
+				printf("%s\n\n", FILE_SEPARATOR);
+			}
+
+			printf("    %s in %s:%d-%d\n", entry->id, entry->file,
+			    entry->line_start, entry->line_end);
+
 			switch (state) {
-			case ENTRY_STATE_SAME:
+			case ENTRY_STATE_RENAMED:
+				printf("      - renamed %s -> %s\n",
+				    entry->id, ent->id);
 				if (ent != NULL)
 					topic_entry_free(ent);
 				continue;
 			case ENTRY_STATE_GONE:
 				changes++;
-				printf("!! chunk '%s' (%d-%d) not found\n",
-				    entry->file, entry->line_start,
-				    entry->line_end);
+				printf("      - not found\n");
 				if (ent != NULL)
 					topic_entry_free(ent);
 				continue;
 			}
 
 			changes++;
-			sep = NULL;
-
-			printf("+- chunk '%s' (%d-%d) ", entry->file,
-			    entry->line_start, entry->line_end);
 
 			a = entry->line_end - entry->line_start;
 			b = ent->line_end - ent->line_start;
 
-			if (a < b)
-				state |= ENTRY_STATE_GREW;
-			else if (a > b)
-				state |= ENTRY_STATE_SHRUNK;
-
 			if (state & ENTRY_STATE_MOVED) {
-				sep = ", ";
-				printf("moved %d-%d",
+				printf("      - moved to %d-%d\n",
 				    ent->line_start, ent->line_end);
 			}
 
-			if (state & ENTRY_STATE_DIFFERS) {
-				if (sep)
-					printf("%s", sep);
-
-				printf("modified");
-
-				if (state &
-				    (ENTRY_STATE_SHRUNK | ENTRY_STATE_GREW))
-					printf(" %+d lines(s)", b - a);
+			if (entry->context != NULL && ent->context != NULL) {
+				if (strcmp(entry->context, ent->context)) {
+					printf("      - parent %s -> %s\n",
+					    entry->context, ent->context);
+				}
 			}
 
-			printf("\n");
+			if (state & ENTRY_STATE_DIFFERS) {
+				printf("      - modified");
+
+				if (a != b)
+					printf(" %+d lines(s)", b - a);
+
+				printf("\n");
+			}
+
 			topic_entry_free(ent);
+
+			if (entry != TAILQ_LAST(&t1->entries, entry_list) ||
+			    !TAILQ_EMPTY(&t2->entries))
+				printf("\n");
 		}
 
 		changes += text_chunk_new_entries(t2, &header);
+
+		topic_free(verify, t1);
 		topic_free(ondisk, t2);
 
-		if (header)
+		if (header) {
+			header = 0;
 			printf("\n");
+		}
 	}
 
-	TAILQ_FOREACH(t1, &ondisk->topics, list) {
+	while ((t1 = TAILQ_FIRST(&ondisk->topics)) != NULL) {
 		header = 0;
 		changes += text_chunk_new_entries(t1, &header);
-		if (header)
-			printf("\n");
+		topic_free(ondisk, t1);
 	}
 
-	if (changes > 0)
-		fatal("%d change%s detected", changes, changes > 1 ? "s" : "");
+	if (changes > 0) {
+		fatal("%s%d change%s detected", header ? "\n" : "",
+		    changes, changes > 1 ? "s" : "");
+	}
 
-	printf("secnote verified\n");
+	printf("secnote identical\n");
 }
 
 static void
 load_from_args(struct context *ctx, int argc, char **argv)
 {
 	struct stat		st;
-	int			idx;
 	FTS			*fts;
 	FTSENT			*ent;
+	int			idx, j;
 	char			*pv[2], *ext;
 
 	for (idx = 0; idx < argc; idx++) {
@@ -360,7 +403,12 @@ load_from_args(struct context *ctx, int argc, char **argv)
 			if ((ext = strrchr(ent->fts_name, '.')) == NULL)
 				continue;
 
-			if (strcmp(ext, ".c") && strcmp(ext, ".h"))
+			for (j = 0; extlist[j].ext != NULL; j++) {
+				if (!strcmp(extlist[j].ext, ext))
+					break;
+			}
+
+			if (extlist[j].ext == NULL)
 				continue;
 
 			file_parse(ctx, ent->fts_path);
@@ -375,7 +423,6 @@ load_from_dump(struct context *ctx, const char *path)
 {
 	struct file	file;
 	int		state;
-	char		buf[512];
 
 	if (!strcmp(path, "-")) {
 		file.fp = stdin;
@@ -386,13 +433,13 @@ load_from_dump(struct context *ctx, const char *path)
 
 	state = DUMP_PARSE_TOPIC;
 
-	while (file_read_line(&file, buf, sizeof(buf))) {
+	while (file_read_line(&file)) {
 		switch (state) {
 		case DUMP_PARSE_TOPIC:
-			state = dump_parse_topic(ctx, &file, buf);
+			state = dump_parse_topic(ctx, &file);
 			break;
 		case DUMP_PARSE_ENTRY:
-			state = dump_parse_entry(ctx, &file, buf);
+			state = dump_parse_entry(ctx, &file);
 			break;
 		default:
 			fatal("invalid parse state %d", state);
@@ -404,34 +451,38 @@ load_from_dump(struct context *ctx, const char *path)
 }
 
 static int
-dump_parse_topic(struct context *ctx, struct file *file, const char *line)
+dump_parse_topic(struct context *ctx, struct file *file)
 {
-	if (line[0] != '@')
-		fatal("expected start of topic, got '%s'", line);
+	if (file->buf[0] != '@' || file->buf[1] != ' ') {
+		if (!strcmp(file->buf, "no topics found"))
+			return (DUMP_PARSE_TOPIC);
+		fatal("expected start of topic, got '%s'", file->buf);
+	}
 
-	ctx->topic = topic_resolve(ctx, &line[2]);
+	ctx->topic = topic_resolve(ctx, &file->buf[2]);
 	file_consume_newline(file);
 
 	return (DUMP_PARSE_ENTRY);
 }
 
 static int
-dump_parse_entry(struct context *ctx, struct file *file, char *line)
+dump_parse_entry(struct context *ctx, struct file *file)
 {
 	int		count;
 	struct entry	*entry;
-	char		**ap, *args[5], *hash, *path, *region, *context;
+	char		**ap, *args[12];
+	char		*id, *line, *hash, *path, *region, *func;
 
-	(void)ctx;
-	(void)file;
-
-	if (line[0] == '\0') {
+	if (file->buf[0] == '\0') {
 		ctx->topic = NULL;
+		ctx->entry = NULL;
 		return (DUMP_PARSE_TOPIC);
 	}
 
 	count = 0;
-	for (ap = args; ap < &args[5] &&
+	line = file->buf;
+
+	for (ap = args; ap < &args[12] &&
 	    (*ap = strsep(&line, ":")) != NULL;) {
 		if (**ap != '\0') {
 			ap++;
@@ -439,19 +490,20 @@ dump_parse_entry(struct context *ctx, struct file *file, char *line)
 		}
 	}
 
-	if (count != 3 && count != 4)
-		fatal("invalid entry in file '%s'", file->path);
+	if (count != 4 && count != 5)
+		fatal("invalid entry in file '%s' (%d)", file->path, count);
 
 	hash = args[0];
-	path = args[1];
-	region = args[2];
+	id = args[1];
+	path = args[2];
+	region = args[3];
 
-	if (count > 3)
-		context = args[3];
+	if (count > 4)
+		func = args[4];
 	else
-		context = NULL;
+		func = NULL;
 
-	entry = topic_record_entry(ctx, ctx->topic, path, context, -1);
+	entry = topic_record_entry(ctx, ctx->topic, id, path, func, -1);
 
 	if (strlcpy(entry->digest, hash, sizeof(entry->digest)) >=
 	    sizeof(entry->digest))
@@ -460,33 +512,72 @@ dump_parse_entry(struct context *ctx, struct file *file, char *line)
 	if (sscanf(region, "%d-%d", &entry->line_start, &entry->line_end) != 2)
 		fatal("invalid region string '%s' in '%s'", region, file->path);
 
+	ctx->entry = entry;
+
 	return (DUMP_PARSE_ENTRY);
 }
 
 static void
 file_open(struct file *file, const char *path, const char *mode)
 {
+	int		i;
+	const char	*ext;
+
 	memset(file, 0, sizeof(*file));
 
 	if ((file->fp = fopen(path, mode)) == NULL)
 		fatal("fopen(%s): %s", path, strerror(errno));
 
-	if ((file->path = strdup(path)) == NULL)
-		fatal("strdup: %s", strerror(errno));
+	file->path = xstrdup(path);
+
+	if ((ext = strrchr(path, '.')) == NULL)
+		return;
+
+	for (i = 0; extlist[i].ext != NULL; i++) {
+		if (!strcmp(extlist[i].ext, ext)) {
+			file->type = extlist[i].type;
+			break;
+		}
+	}
 }
 
 static void
 file_close(struct file *file)
 {
+	int		line;
+
+	if (file->line > 0 && file->lc != NULL) {
+		line = file->line - 1;
+
+		while (line >= 0) {
+			free(file->lc[line]);
+			line--;
+		}
+	}
+
 	fclose(file->fp);
+
+	free(file->lc);
 	free(file->path);
 }
 
-static int
-file_read_line(struct file *file, char *buf, size_t len)
+static void
+file_cache_line(struct file *file, char *buf)
 {
-	if (fgets(buf, len, file->fp) != NULL) {
-		buf[strcspn(buf, "\n")] = '\0';
+	size_t		newsz;
+
+	newsz = sizeof(char *) * (file->line + 1);
+	if ((file->lc = realloc(file->lc, newsz)) == NULL)
+		fatal("realloc(%zu): %s", newsz, strerror(errno));
+
+	file->lc[file->line++] = xstrdup(buf);
+}
+
+static int
+file_read_line(struct file *file)
+{
+	if (fgets(file->buf, sizeof(file->buf), file->fp) != NULL) {
+		file->buf[strcspn(file->buf, "\n")] = '\0';
 		return (1);
 	}
 
@@ -500,101 +591,82 @@ file_read_line(struct file *file, char *buf, size_t len)
 static void
 file_consume_newline(struct file *file)
 {
-	char		buf[512];
-
-	if (!file_read_line(file, buf, sizeof(buf)))
+	if (!file_read_line(file))
 		fatal("expected newline, got eof in '%s'", file->path);
 
-	if (buf[0] != '\0')
-		fatal("expected newline, got '%s' in '%s'", buf, file->path);
+	if (file->buf[0] != '\0') {
+		fatal("expected newline, got '%s' in '%s'",
+		    file->buf, file->path);
+	}
 }
 
 static void
 file_parse(struct context *ctx, const char *path)
 {
+	size_t			idx;
 	struct file		file;
+	const char		*func;
 	struct entry		*entry;
 	struct topic		*topic;
-	size_t			newsz, idx;
-	const char		*context, *errstr;
+	char			*id, *name, *p, *s;
+	int			len, indent, pos, order;
 	u_int8_t		digest[SHA256_DIGEST_LENGTH];
-	char			buf[512], name[64], *p, **lc;
-	int			len, indent, pos, line, order;
 
 	file_open(&file, path, "r");
 
-	line = 0;
-	lc = NULL;
+	while (file_read_line(&file)) {
+		file_cache_line(&file, file.buf);
 
-	while (file_read_line(&file, buf, sizeof(buf))) {
-		newsz = sizeof(char *) * (line + 1);
-		if ((lc = realloc(lc, newsz)) == NULL)
-			fatal("realloc(%zu): %s", newsz, strerror(errno));
-
-		if ((lc[line++] = strdup(buf)) == NULL)
-			fatal("strdup: %s", strerror(errno));
-
-		if ((p = strstr(buf, TAG_OPEN)) == NULL)
+		if ((p = strstr(file.buf, TAG_OPEN)) == NULL)
 			continue;
 
-		context = NULL;
-		if (line > 0) {
-			pos = line - 1;
+		func = NULL;
+		p += sizeof(TAG_OPEN) - 1;
+
+		if (file.line > 0) {
+			pos = file.line - 1;
 			while (pos >= 0) {
-				if (isalpha(*(unsigned char *)lc[pos]) ||
-				    lc[pos][0] == '_') {
-					context = lc[pos];
+				if (file.type == FILE_TYPE_PYTHON &&
+				    ((s = strstr(file.lc[pos], "def ")))) {
+					func = s + sizeof("def ") - 1;
+					break;
+				}
+				if (isalpha(*(unsigned char *)file.lc[pos]) ||
+				    file.lc[pos][0] == '_') {
+					func = file.lc[pos];
 					break;
 				}
 				pos--;
 			}
 		}
 
-		p += sizeof(TAG_OPEN) - 1;
-		memset(name, 0, sizeof(name));
-
-		if (sscanf(p, " topic=%63s", name) != 1) {
-			fprintf(stderr, "malformed %s in %s:%d\n",
-			    TAG_OPEN, path, line);
+		if (note_parse_arguments(p, &order, &name, &id) == -1) {
+			fprintf(stderr, "skipping malformed secnote in %s:%d\n",
+			    file.path, file.line);
 			continue;
 		}
 
-		order = -1;
-		if ((p = strchr(name, ':')) != NULL) {
-			*(p)++ = '\0';
-
-			errstr = NULL;
-			order = strtonum(p, 0, USHRT_MAX, &errstr);
-			if (errstr != NULL) {
-				fprintf(stderr, "malformed topic in %s:%d\n",
-				    path, line);
-				continue;
-			}
+		topic = topic_resolve(ctx, name);
+		entry = topic_record_entry(ctx, topic, id, path, func, order);
+		if (entry == NULL) {
+			fprintf(stderr, "skipping duplicate senote in %s:%d\n",
+			    file.path, file.line);
+			continue;
 		}
 
-		topic = topic_resolve(ctx, name);
-		entry = topic_record_entry(ctx, topic, path, context, order);
-
 		indent = -1;
-		entry->line_start = line + 1;
+		entry->line_start = file.line + 1;
 
 		for (;;) {
-			if (!file_read_line(&file, buf, sizeof(buf)))
+			if (!file_read_line(&file))
 				fatal("EOF in '%s' before end section", path);
 
-			newsz = sizeof(char *) * (line + 1);
-			if ((lc = realloc(lc, newsz)) == NULL) {
-				fatal("realloc(%zu): %s", newsz,
-				    strerror(errno));
-			}
+			file_cache_line(&file, file.buf);
 
-			if ((lc[line++] = strdup(buf)) == NULL)
-				fatal("strdup: %s", strerror(errno));
-
-			if (strstr(buf, TAG_CLOSE))
+			if (strstr(file.buf, TAG_CLOSE))
 				break;
 
-			p = buf;
+			p = file.buf;
 
 			if (indent == -1) {
 				indent = 0;
@@ -625,18 +697,65 @@ file_parse(struct context *ctx, const char *path)
 				fatal("failed to create hex digest");
 		}
 
-		entry->line_end = line - 1;
+		entry->line_end = file.line - 1;
 	}
 
-	line = line - 1;
-
-	while (line >= 0) {
-		free(lc[line]);
-		line--;
-	}
-
-	free(lc);
 	file_close(&file);
+}
+
+static int
+note_parse_arguments(char *note, int *order, char **topic, char **id)
+{
+	const char	*errstr;
+	int		idx, count;
+	char		*v, *args[5], **ap, **ptr;
+
+	*id = NULL;
+	*order = -1;
+	*topic = NULL;
+
+	count = 0;
+	for (ap = args; ap < &args[5] &&
+	    (*ap = strsep(&note, " ")) != NULL;) {
+		if (**ap != '\0') {
+			ap++;
+			count++;
+		}
+	}
+
+	for (idx = 0; idx < count; idx++) {
+		v = NULL;
+		ptr = NULL;
+
+		if (!strncmp(args[idx], "topic=", sizeof("topic=") - 1))
+			ptr = topic;
+
+		if (!strncmp(args[idx], "id=", sizeof("id=") - 1))
+			ptr = id;
+
+		if (ptr == NULL)
+			continue;
+
+		if ((v = strchr(args[idx], '=')) == NULL)
+			fatal("failure to find '=' unexpected");
+
+		*(v)++ = '\0';
+		*ptr = v;
+	}
+
+	if (*topic == NULL || *id == NULL)
+		return (-1);
+
+	if ((v = strchr(*topic, ':')) != NULL) {
+		*(v)++ = '\0';
+
+		errstr = NULL;
+		*order = strtonum(v, 0, USHRT_MAX, &errstr);
+		if (errstr != NULL)
+			return (-1);
+	}
+
+	return (0);
 }
 
 static struct topic *
@@ -655,10 +774,9 @@ topic_resolve(struct context *ctx, const char *name)
 		if ((topic = calloc(1, sizeof(*topic))) == NULL)
 			fatal("%s: calloc", __func__);
 
-		if ((topic->name = strdup(name)) == NULL)
-			fatal("%s: strdup", __func__);
-
+		topic->name = xstrdup(name);
 		TAILQ_INIT(&topic->entries);
+
 		TAILQ_INSERT_TAIL(&ctx->topics, topic, list);
 	}
 
@@ -693,17 +811,29 @@ topic_entry_free(struct entry *entry)
 	}
 
 	free(entry->context);
+	free(entry->id);
 	free(entry->file);
 	free(entry);
 }
 
 static struct entry *
-topic_record_entry(struct context *ctx, struct topic *topic, const char *file,
-    const char *context, int order)
+topic_record_entry(struct context *ctx, struct topic *topic, const char *id,
+    const char *file, const char *context, int order)
 {
-	const char		*p;
 	int			strip;
+	const char		*p, *s;
 	struct entry		*entry, *ent;
+
+	TAILQ_FOREACH(entry, &topic->entries, list) {
+		if (!strcmp(entry->id, id)) {
+			fprintf(stderr,
+			    "duplicate id '%s' in file %s for topic '%s', ",
+			    id, file, topic->name);
+			fprintf(stderr, "previously used in file %s:%d\n",
+			    entry->file, entry->line_start);
+			return (NULL);
+		}
+	}
 
 	if ((entry = calloc(1, sizeof(*entry))) == NULL)
 		fatal("%s: calloc failed", __func__);
@@ -719,23 +849,27 @@ topic_record_entry(struct context *ctx, struct topic *topic, const char *file,
 	}
 
 	if (p == NULL)
-		fatal("-p%d doesn't work on '%s'", ctx->pnum, file);
+		fatal("-p%d makes no sense with '%s'", ctx->pnum, file);
 
-	if ((entry->file = strdup(p)) == NULL)
-		fatal("%s: strdup failed", __func__);
+	entry->id = xstrdup(id);
+	entry->file = xstrdup(p);
+
+	if (context) {
+		s = context;
+		while (isspace(*(const unsigned char *)s))
+			s++;
+
+		if ((p = strchr(s, '(')) == NULL)
+			p = s + strlen(s);
+
+		if ((entry->context = strndup(s, p - s)) == NULL)
+			fatal("%s: strdup failed", __func__);
+	}
 
 	entry->order = order;
 
 	if (!SHA256_Init(&entry->shactx))
 		fatal("failed to initialise SHA256 context");
-
-	if (context) {
-		if ((p = strchr(context, '(')) == NULL)
-			p = context + strlen(context);
-
-		if ((entry->context = strndup(context, p - context)) == NULL)
-			fatal("%s: strdup failed", __func__);
-	}
 
 	ent = NULL;
 	TAILQ_INIT(&entry->lines);
@@ -763,8 +897,7 @@ entry_record_line(struct entry *entry, const char *code)
 	if ((line = calloc(1, sizeof(*line))) == NULL)
 		fatal("%s: calloc", __func__);
 
-	if ((line->code = strdup(code)) == NULL)
-		fatal("%s: strdup", __func__);
+	line->code = xstrdup(code);
 
 	if (!SHA256_Update(&entry->shactx, code, strlen(code)))
 		fatal("failed to update digest");
@@ -776,39 +909,46 @@ static int
 entry_check_state(struct entry_list *head, struct entry *orig,
     struct entry **out)
 {
+	int		state;
 	struct entry	*entry;
-	int		a, b, state;
+
+	*out = NULL;
+	state = ENTRY_STATE_GONE;
 
 	TAILQ_FOREACH(entry, head, list) {
 		if (strcmp(orig->file, entry->file))
 			continue;
 
-		*out = entry;
-
-		a = MAX(orig->line_start, entry->line_start);
-		b = MIN(orig->line_end, entry->line_end);
-
-		if (a <= b) {
-			if (!strcmp(entry->digest, orig->digest)) {
-				state = ENTRY_STATE_SAME;
-				if (orig->line_start != entry->line_start)
-					return (state | ENTRY_STATE_MOVED);
-				return (state);
+		if (strcmp(orig->id, entry->id)) {
+			if (orig->line_start == entry->line_start &&
+			    orig->line_end == entry->line_end &&
+			    !strcmp(orig->digest, entry->digest)) {
+				*out = entry;
+				return (ENTRY_STATE_RENAMED);
 			}
 
-			if (orig->line_start == entry->line_start)
-				return (ENTRY_STATE_DIFFERS);
-
-			return (ENTRY_STATE_DIFFERS | ENTRY_STATE_MOVED);
+			continue;
 		}
 
+		state = 0;
+		*out = entry;
+
+		if (orig->line_start != entry->line_start ||
+		    orig->line_end != entry->line_end)
+			state |= ENTRY_STATE_MOVED;
+
 		if (!strcmp(entry->digest, orig->digest))
-			return (ENTRY_STATE_SAME | ENTRY_STATE_MOVED);
+			state |= ENTRY_STATE_SAME;
+		else
+			state |= ENTRY_STATE_DIFFERS;
+
+		break;
 	}
 
-	*out = NULL;
+	if (state == ENTRY_STATE_GONE)
+		*out = NULL;
 
-	return (ENTRY_STATE_GONE);
+	return (state);
 }
 
 static int
@@ -822,12 +962,14 @@ text_chunk_new_entries(struct topic *topic, int *header)
 	TAILQ_FOREACH(entry, &topic->entries, list) {
 		if (*header == 0) {
 			*header = 1;
-			printf("@ %s\n\n", topic->name);
+			printf("%s\n", FILE_SEPARATOR);
+			printf("%s\n", topic->name);
+			printf("%s\n\n", FILE_SEPARATOR);
 		}
 
 		new++;
-		printf("++ chunk '%s' (%d-%d) new\n", entry->file,
-		    entry->line_start, entry->line_end);
+		printf("    %s in %s:%d-%d\n      - new\n", entry->id,
+		    entry->file, entry->line_start, entry->line_end);
 	}
 
 	return (new);
@@ -885,8 +1027,8 @@ text_topic_write(struct context *ctx, struct topic *topic)
 
 	TAILQ_FOREACH(entry, &topic->entries, list) {
 		if (ctx->list) {
-			if (ctx->digest)
-				printf("%s:", entry->digest);
+			if (ctx->db)
+				printf("%s:%s:", entry->digest, entry->id);
 			printf("%s:%d-%d", entry->file,
 			    entry->line_start, entry->line_end);
 			if (entry->context)
@@ -901,7 +1043,8 @@ text_topic_write(struct context *ctx, struct topic *topic)
 			last = entry->file;
 		}
 
-		printf("@@ %d-%d @@", entry->line_start, entry->line_end);
+		printf("@@ %s, %d-%d @@ ", entry->id,
+		    entry->line_start, entry->line_end);
 
 		if (entry->context)
 			printf(" %s ", entry->context);
@@ -930,6 +1073,17 @@ filecmp(const FTSENT **a1, const FTSENT **b1)
 	const FTSENT	*b = *b1;
 
 	return (strcmp(a->fts_name, b->fts_name));
+}
+
+static char *
+xstrdup(const char *str)
+{
+	char	*ptr;
+
+	if ((ptr = strdup(str)) == NULL)
+		fatal("strdup: %s", strerror(errno));
+
+	return (ptr);
 }
 
 static void
