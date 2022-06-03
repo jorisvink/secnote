@@ -259,8 +259,10 @@ context_compare(struct context *verify, struct context *ondisk)
 
 		if (t2 == NULL) {
 			changes++;
-			printf("topic '%s' not found in source\n", t1->name);
+			printf("topic '%s' not found in new code\n", t1->name);
 			topic_free(verify, t1);
+			if (TAILQ_EMPTY(&verify->topics))
+				printf("\n");
 			continue;
 		}
 
@@ -354,8 +356,8 @@ context_compare(struct context *verify, struct context *ondisk)
 	}
 
 	if (changes > 0) {
-		fatal("%s%d change%s detected", header ? "\n" : "",
-		    changes, changes > 1 ? "s" : "");
+		fatal("%s%d change%s detected",
+		    header ? "\n" : "", changes, changes > 1 ? "s" : "");
 	}
 
 	printf("secnote identical\n");
