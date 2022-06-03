@@ -921,6 +921,12 @@ entry_check_state(struct entry_list *head, struct entry *orig,
 		if (strcmp(orig->file, entry->file))
 			continue;
 
+		/* @secnote-open topic=note-matching id=match-id */
+		/*
+		 * Attemp to the match the ID of the note to resolve it.
+		 * If it does not match but we see the note is otherwise
+		 * the same, we mark it as renamed.
+		 */
 		if (strcmp(orig->id, entry->id)) {
 			if (orig->line_start == entry->line_start &&
 			    orig->line_end == entry->line_end &&
@@ -931,18 +937,31 @@ entry_check_state(struct entry_list *head, struct entry *orig,
 
 			continue;
 		}
+		/* @secnote-close */
 
 		state = 0;
 		*out = entry;
 
+		/* @secnote-open topic=note-matching id=match-position */
+		/*
+		 * If the note moved start or end line it was considered
+		 * moved from the original note.
+		 */
 		if (orig->line_start != entry->line_start ||
 		    orig->line_end != entry->line_end)
 			state |= ENTRY_STATE_MOVED;
+		/* @secnote-close */
 
+		/* @secnote-open topic=note-matching id=match-digest */
+		/*
+		 * Finally if the digest matches the original note its
+		 * digest we know it has not changed contents.
+		 */
 		if (!strcmp(entry->digest, orig->digest))
 			state |= ENTRY_STATE_SAME;
 		else
 			state |= ENTRY_STATE_DIFFERS;
+		/* @secnote-close */
 
 		break;
 	}
@@ -1045,13 +1064,11 @@ text_topic_write(struct context *ctx, struct topic *topic)
 			last = entry->file;
 		}
 
-		printf("@@ %s, %d-%d @@ ", entry->id,
+		printf("@@ %s %d-%d @@ ", entry->id,
 		    entry->line_start, entry->line_end);
 
 		if (entry->context)
-			printf(" %s ", entry->context);
-		else
-			printf(" ");
+			printf("%s ", entry->context);
 
 		if (entry->order != -1)
 			printf("(%d)\n", entry->order);
