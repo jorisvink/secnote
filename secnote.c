@@ -259,7 +259,8 @@ context_compare(struct context *verify, struct context *ondisk)
 
 		if (t2 == NULL) {
 			changes++;
-			printf("topic '%s' not found in new code\n", t1->name);
+			printf("topic '%s' not found in given source\n",
+			    t1->name);
 			topic_free(verify, t1);
 			if (TAILQ_EMPTY(&verify->topics))
 				printf("\n");
@@ -1009,13 +1010,11 @@ text_topic_dump(struct context *ctx)
 				text_topic_write(ctx, topic);
 			else
 				text_topic_header(ctx, topic);
-
-			continue;
+		} else {
+			if (ctx->query == NULL ||
+			    fnmatch(ctx->query, topic->name, FNM_NOESCAPE) == 0)
+				text_topic_write(ctx, topic);
 		}
-
-		if (ctx->query == NULL ||
-		    fnmatch(ctx->query, topic->name, FNM_NOESCAPE) == 0)
-			text_topic_write(ctx, topic);
 
 		topic_free(ctx, topic);
 	}
@@ -1049,8 +1048,8 @@ text_topic_write(struct context *ctx, struct topic *topic)
 	TAILQ_FOREACH(entry, &topic->entries, list) {
 		if (ctx->list) {
 			if (ctx->db)
-				printf("%s:%s:", entry->digest, entry->id);
-			printf("%s:%d-%d", entry->file,
+				printf("%s:", entry->digest);
+			printf("%s:%s:%d-%d", entry->id, entry->file,
 			    entry->line_start, entry->line_end);
 			if (entry->context)
 				printf(":%s", entry->context);
