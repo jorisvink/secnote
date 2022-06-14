@@ -162,7 +162,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "Usage: secnote [-pnum] [-l [-f] | -d | -q query] [src]\n");
+	    "Usage: secnote [-pnum] [-l [-f] | -d | -q query | -v db] [src]\n");
 	exit(1);
 }
 
