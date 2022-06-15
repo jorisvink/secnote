@@ -1,4 +1,4 @@
-# What is secnote?
+# About secnote
 
 A tool to help mark sections in code as security critical or build
 code flows, all from within the code itself.
@@ -15,6 +15,13 @@ The open marker must include a topic and id.
 The note is closed with a @secnote-close marker.
 
   /* @secnote-close */
+
+A note can have a weight attached to it. This is used by secnote
+for ordering the notes when multiple exist in the same topic.
+
+To do so, specify the weight after the topic name:
+
+  /* @secnote-open topic=a-topic:100 ... */
 
 # Show
 
