@@ -36,6 +36,8 @@
 #include <bsd/bsd.h>
 #endif
 
+#define VERSION			"0.1"
+
 #define FILE_TYPE_C		1
 #define FILE_TYPE_PYTHON	2
 
@@ -181,7 +183,7 @@ main(int argc, char *argv[])
 	TAILQ_INIT(&ctx.topics);
 	TAILQ_INIT(&vfy.topics);
 
-	while ((ch = getopt(argc, argv, "dfhlp:q:v:")) != -1) {
+	while ((ch = getopt(argc, argv, "dfhlp:q:v:V")) != -1) {
 		switch (ch) {
 		case 'd':
 			ctx.db = 1;
@@ -206,6 +208,9 @@ main(int argc, char *argv[])
 		case 'v':
 			verify = optarg;
 			break;
+		case 'V':
+			fatal("secnote %s", VERSION);
+			/* NOTREACHED */
 		case 'h':
 		default:
 			usage();
