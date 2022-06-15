@@ -11,11 +11,13 @@ body {
 h1 {
     margin-top: 25px;
     margin-bottom: 25px;
+    border-bottom: 1px solid #ccc;
 }
 
 h2 {
     margin-top: 35px;
     margin-bottom: 10px;
+    border-bottom: 1px solid #ccc;
 }
 
 ul {
@@ -45,6 +47,8 @@ code {
     color: black;
     padding: 5px;
     border-radius: 5px;
+    padding-bottom: 20px;
+    white-space: pre-wrap;
     display: block;
     font-family: 'Courier New', monospace;
 }
