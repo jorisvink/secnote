@@ -11,10 +11,9 @@ SRC=	secnote.c
 CFLAGS+=-Wall -Wextra -Werror -Wstrict-prototypes -Wmissing-prototypes
 CFLAGS+=-Wmissing-declarations -Wshadow -Wpointer-arith -Wcast-qual
 CFLAGS+=-Wsign-compare -std=c99 -pedantic
-CFLAGS+=-fsanitize=address -fstack-protector-all
+CFLAGS+=-fstack-protector-all
 CFLAGS+=$(shell pkg-config openssl --cflags)
 
-LDFLAGS+=-fsanitize=address
 LDFLAGS+=$(shell pkg-config openssl --libs)
 
 OSNAME=$(shell uname -s | sed -e 's/[-_].*//g' | tr A-Z a-z)
