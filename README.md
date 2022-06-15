@@ -5,6 +5,19 @@ build code flows, all from within the code itself.
 
 ## Building
 
+### platforms
+
+secnote should build on Linux distros like Ubuntu and Debian,
+on OpenBSD and on MacOS.
+
+### requirements
+
+- libbsd-dev (on linux)
+- openssl / libressl
+- pkg-config
+
+### build
+
 ```
 $ make
 $ make install
