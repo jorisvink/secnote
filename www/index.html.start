@@ -3,7 +3,7 @@
 
 <head>
 <title>secnote - A way to document security critical code</title>
-<link rel="stylesheet" href="/style.css" />
+<link rel="stylesheet" href="/secnote/style.css" />
 </head>
 
 <body>
