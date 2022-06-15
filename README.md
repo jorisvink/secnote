@@ -3,6 +3,13 @@
 A tool to help mark sections in code as security critical or
 build code flows, all from within the code itself.
 
+## Building
+
+```
+$ make
+$ make install
+```
+
 ## How
 
 A secnote is opened with a @secnote-open marker.
