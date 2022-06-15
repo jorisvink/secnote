@@ -14,7 +14,7 @@ The open marker must include a topic and id.
 
 The note is closed with a @secnote-close marker.
 
-  /* @secnote-close
+  /* @secnote-close */
 
 # Show
 
