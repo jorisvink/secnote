@@ -19,8 +19,8 @@ on OpenBSD and on MacOS.
 ### build
 
 ```
-$ make
-$ make install
+  $ make
+  $ make install
 ```
 
 ## How
