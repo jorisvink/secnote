@@ -40,6 +40,7 @@
 
 #define FILE_TYPE_C		1
 #define FILE_TYPE_PYTHON	2
+#define FILE_TYPE_GO		3
 
 #define DUMP_PARSE_TOPIC	1
 #define DUMP_PARSE_ENTRY	2
@@ -157,6 +158,7 @@ static struct {
 	{ ".c",		FILE_TYPE_C },
 	{ ".h",		FILE_TYPE_C },
 	{ ".py",	FILE_TYPE_PYTHON },
+	{ ".go",	FILE_TYPE_GO },
 	{ NULL,		-1 },
 };
 
@@ -637,6 +639,11 @@ file_parse(struct context *ctx, const char *path)
 				if (file.type == FILE_TYPE_PYTHON &&
 				    ((s = strstr(file.lc[pos], "def ")))) {
 					func = s + sizeof("def ") - 1;
+					break;
+				}
+				if (file.type == FILE_TYPE_GO &&
+				    ((s = strstr(file.lc[pos], "func ")))) {
+					func = s + sizeof("func ") - 1;
 					break;
 				}
 				if (isalpha(*(unsigned char *)file.lc[pos]) ||
